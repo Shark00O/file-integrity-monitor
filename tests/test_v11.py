@@ -261,14 +261,19 @@ def test_export_scan_results_lists_all_files(
     assert "a.txt,MODIFIED" in csv_path.read_text(encoding="utf-8")
 
 
-def test_tray_fallback_when_pystray_missing() -> None:
+def test_tray_fallback_when_pystray_missing(monkeypatch) -> None:
     """Without pystray installed, the tray must report unavailable."""
     import sys
 
     import fim_tray
 
-    if "pystray" in sys.modules:
-        pytest.skip("pystray is installed in this environment.")
+    # Simulate pystray being missing, even on a machine where it is
+    # installed (like Windows). Setting sys.modules["pystray"] to
+    # None makes `import pystray` raise ImportError. The old test
+    # only skipped when pystray was already imported, so on Windows
+    # it ran with pystray present and failed for the wrong reason:
+    # the tray was correctly available, the test was wrong.
+    monkeypatch.setitem(sys.modules, "pystray", None)
     assert fim_tray.tray_available() is False
     controller = fim_tray.TrayController(
         on_show=lambda: None,

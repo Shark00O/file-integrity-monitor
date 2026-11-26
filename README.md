@@ -8,8 +8,6 @@ I built it because I wanted a tool I actually understand, not a black box.
 It is the kind of thing Tripwire and AIDE do, written in plain Python so
 you can read every line and see how the checking works.
 
-Author: Sufiyaan Shaikh — BCA Cybersecurity student, Bengaluru.
-
 ## How it works
 
 1. `init` walks a folder, hashes every file in 64 KB chunks, and writes
@@ -217,4 +215,4 @@ path traversal, empty files and unreadable files.
 
 ## License
 
-MIT — see `LICENSE`. Author: Sufiyaan Shaikh, 2026.
+MIT — see `LICENSE`.

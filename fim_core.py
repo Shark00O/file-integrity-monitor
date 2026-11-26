@@ -1,4 +1,4 @@
-# File Integrity Monitor — core engine.
+# File Integrity Monitor - core engine.
 # All hashing, baseline, signing, scanning and alert logic lives here.
 """Core engine for the File Integrity Monitor.
 
@@ -14,6 +14,7 @@ means the baseline is refused, never silently used or overwritten.
 
 from __future__ import annotations
 
+import base64
 import csv
 import fnmatch
 import hashlib
@@ -21,12 +22,16 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import smtplib
 import sqlite3
 import stat
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -34,6 +39,12 @@ from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+
+VERSION = "1.1.0"
+GITHUB_REPO = "Shark00O/file-integrity-monitor"
+UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+WEBHOOK_TYPES = ("discord", "slack", "generic")
+ALERT_CHANNELS = ("console", "log", "desktop", "email", "webhook")
 
 
 def get_project_root() -> Path:
@@ -77,6 +88,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "baseline_path": "baseline",
     "report_dir": "reports",
     "max_file_size_mb": 0,
+    "webhook_url": "",
+    "webhook_type": "discord",
+    "check_for_updates": True,
+    "scheduled_scan_interval_minutes": 0,
+    "mass_change_threshold": 10,
+    "mass_change_percent": 20,
+    "gui_theme": "light",
 }
 
 
@@ -164,6 +182,12 @@ class VerifyResult:
     changes: list[Change] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     scanned_at_utc: str = ""
+    # Every file found in the live scan, so callers (e.g. the GUI) can
+    # show unchanged files as OK instead of only listing changes.
+    records: list[FileRecord] = field(default_factory=list)
+    # True when the change count trips the mass-change rule (see
+    # is_mass_change): many files changed in one scan.
+    mass_change: bool = False
 
 
 def _utc_now_iso() -> str:
@@ -312,6 +336,218 @@ def verify_signed_baseline(data: dict[str, Any], key: bytes) -> bool:
     payload = {k: v for k, v in data.items() if k != "hmac"}
     actual = hmac.new(key, _canonical_payload_bytes(payload), hashlib.sha256)
     return hmac.compare_digest(expected, actual.hexdigest())
+
+
+ENCRYPTED_BASELINE_FORMAT = "fim-encrypted-v1"
+ENCRYPTION_LABEL = b"fim-encryption-v1"
+
+
+def _derive_encryption_key(key: bytes) -> bytes:
+    """Derive a separate encryption key from the HMAC key.
+
+    The HMAC key itself is never used directly as a stream key.
+    A fixed domain-separation label keeps the two uses apart.
+    """
+    return hmac.new(key, ENCRYPTION_LABEL, hashlib.sha256).digest()
+
+
+def _xor_with_keystream(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    """XOR data with an HMAC-SHA256 counter-mode keystream.
+
+    This is NOT AES. It is a documented, stdlib-only stream cipher:
+    each 32-byte block is HMAC(enc_key, nonce || counter). The nonce
+    is random per write and is stored with the ciphertext, so a
+    keystream is never reused for a different plaintext. The
+    ciphertext is authenticated by the HMAC over the whole
+    baseline file (see sign_baseline), so a flipped bit is detected
+    before decryption is trusted. Limits: if the 32-byte HMAC key
+    leaks, an attacker can decrypt; there is no forward secrecy.
+    """
+    out = bytearray()
+    counter = 0
+    while len(out) < len(data):
+        block = hmac.new(
+            key, nonce + counter.to_bytes(8, "big"), hashlib.sha256
+        ).digest()
+        chunk = data[len(out) : len(out) + len(block)]
+        out.extend(b ^ block[i] for i, b in enumerate(chunk))
+        counter += 1
+    return bytes(out)
+
+
+def _write_baseline_json(json_path: Path, payload: dict[str, Any], key: bytes) -> None:
+    """Write baseline.json encrypted and signed.
+
+    The file on disk is {"format": "fim-encrypted-v1", "data": base64,
+    "hmac": ...}. The plaintext (file names, hashes, paths) never
+    appears in the file. The HMAC covers the ciphertext, so tampering
+    is caught before decryption.
+    """
+    plaintext = _canonical_payload_bytes(payload)
+    enc_key = _derive_encryption_key(key)
+    nonce = secrets.token_bytes(16)
+    encrypted = nonce + _xor_with_keystream(enc_key, nonce, plaintext)
+    wrapper: dict[str, Any] = {
+        "format": ENCRYPTED_BASELINE_FORMAT,
+        "data": base64.b64encode(encrypted).decode("ascii"),
+    }
+    signed = sign_baseline(wrapper, key)
+    write_file_atomic(
+        json_path, json.dumps(signed, indent=2, sort_keys=True).encode("utf-8")
+    )
+
+
+def _read_baseline_payload(data: dict[str, Any], key: bytes) -> dict[str, Any]:
+    """Verify a baseline dict and return its plaintext payload.
+
+    Handles both the new encrypted format and the old plain signed
+    format (migration: old baselines load, and are re-written
+    encrypted on the next init/update or key rotation).
+    """
+    if not verify_signed_baseline(data, key):
+        raise BaselineError("Baseline tampered or corrupt.")
+    if data.get("format") == ENCRYPTED_BASELINE_FORMAT:
+        try:
+            encrypted = base64.b64decode(str(data.get("data", "")), validate=True)
+        except Exception as exc:
+            raise BaselineError("Baseline tampered or corrupt.") from exc
+        if len(encrypted) < 17:
+            raise BaselineError("Baseline tampered or corrupt.")
+        nonce, ciphertext = encrypted[:16], encrypted[16:]
+        enc_key = _derive_encryption_key(key)
+        plaintext = _xor_with_keystream(enc_key, nonce, ciphertext)
+        try:
+            payload = json.loads(plaintext.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BaselineError("Baseline tampered or corrupt.") from exc
+        if not isinstance(payload, dict):
+            raise BaselineError("Baseline is corrupt: payload is missing.")
+        return payload
+    return data
+
+
+def _baseline_subdir_name(root: Path) -> str:
+    """Return a safe, collision-free subfolder name for one folder.
+
+    "<folder-name>_<first-12-hex-of-sha256-of-absolute-path>".
+    Two folders with the same name in different places get different
+    names, and the name can never contain a path separator.
+    """
+    resolved = str(Path(root).resolve())
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(resolved).name) or "root"
+    return f"{safe_name}_{digest}"
+
+
+def resolve_baseline_dir(
+    base_dir: Path, root: Path, single_folder: bool = True
+) -> Path:
+    """Return the baseline directory for one monitored folder.
+
+    One folder keeps using baseline/ itself, exactly as in v1.0, so
+    an existing single-folder baseline keeps working. When several
+    folders are monitored at once, each gets its own
+    baseline/<name>_<hash>/ subfolder. Switching from one folder to
+    several (or back) requires re-running init for the folders
+    involved - that migration is documented in the README.
+    """
+    base = Path(base_dir)
+    if single_folder:
+        return base
+    return base / _baseline_subdir_name(root)
+
+
+def find_baseline_dir(base_dir: Path, root: Path) -> Path:
+    """Return the baseline directory that actually holds a folder's baseline.
+
+    Prefers the single-folder location (baseline/ itself, v1.0), and
+    falls back to the multi-folder subfolder when that is where the
+    baseline lives - so verifying or scheduling one folder still works
+    after the folder was initialised as part of several. When neither
+    exists, the single-folder location is returned, so the error
+    message stays the familiar "run fim init first".
+    """
+    base = Path(base_dir)
+    if (base / "baseline.json").exists():
+        return base
+    multi = base / _baseline_subdir_name(root)
+    if (multi / "baseline.json").exists():
+        return multi
+    return base
+
+
+def rotate_baseline_key(baseline_dir: Path, key_path: Path) -> int:
+    """Re-encrypt and re-sign a baseline with a fresh 32-byte key.
+
+    The old baseline is verified first; a tampered baseline is
+    refused and the key is left untouched. Returns the file count.
+    Old-format baselines are migrated to the encrypted format.
+    """
+    baseline_dir = Path(baseline_dir)
+    records = load_baseline(baseline_dir, key_path)
+    payload = _load_baseline_payload_for_rotation(baseline_dir, key_path)
+    new_key = secrets.token_bytes(32)
+    key_path = Path(key_path)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    write_file_atomic(key_path, new_key)
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        LOGGER.debug("Could not set 0600 on the key file.", exc_info=True)
+    _write_baseline_json(baseline_dir / "baseline.json", payload, new_key)
+    write_sha256_sidecar(baseline_dir / "baseline.json")
+    return len(records)
+
+
+def _load_baseline_payload_for_rotation(
+    baseline_dir: Path, key_path: Path
+) -> dict[str, Any]:
+    """Load the raw payload dict for rotation, after verifying it."""
+    baseline_dir = Path(baseline_dir)
+    json_path = baseline_dir / "baseline.json"
+    key = load_key(key_path)
+    if key is None:
+        raise BaselineError("HMAC key not found. Run fim init first.")
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BaselineError(f"Baseline is corrupt and cannot be read: {exc}") from exc
+    if not verify_sha256_sidecar(json_path):
+        raise BaselineError("Baseline tampered or corrupt.")
+    return _read_baseline_payload(data, key)
+
+
+def get_theme_colours(theme: str) -> dict[str, str]:
+    """Return the GUI colour map for a theme; pure logic, no display."""
+    if theme == "dark":
+        return {
+            "background": "#1e1e1e",
+            "surface": "#2b2b2b",
+            "text": "#e8e8e8",
+            "muted": "#a8a8a8",
+            "field": "#333333",
+            "heading": "#3a3a3a",
+            "selected": "#0e639c",
+        }
+    return {
+        "background": "#f0f0f0",
+        "surface": "#ffffff",
+        "text": "#1a1a1a",
+        "muted": "#555555",
+        "field": "#ffffff",
+        "heading": "#e0e0e0",
+        "selected": "#0078d7",
+    }
+
+
+def save_config(config_path: Path, config: dict[str, Any]) -> None:
+    """Write a config dict back to disk as sorted, readable JSON."""
+    config_path = Path(config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    write_file_atomic(
+        config_path,
+        (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    )
 
 
 def write_file_atomic(path: Path, data: bytes) -> None:
@@ -522,7 +758,32 @@ def _init_database(database_path: Path) -> None:
             "added INTEGER, deleted INTEGER, modified INTEGER, "
             "renamed INTEGER, errors INTEGER)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS meta (" "key TEXT PRIMARY KEY, value TEXT)"
+        )
         connection.commit()
+
+
+def _store_meta(database_path: Path, values: dict[str, str]) -> None:
+    """Store small baseline metadata (path, created time) in SQLite."""
+    with DB_WRITE_LOCK, sqlite3.connect(str(database_path)) as connection:
+        connection.executemany(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            list(values.items()),
+        )
+        connection.commit()
+
+
+def _read_meta(database_path: Path) -> dict[str, str]:
+    """Read baseline metadata from SQLite, or {} if it is absent."""
+    if not Path(database_path).exists():
+        return {}
+    try:
+        with sqlite3.connect(str(database_path)) as connection:
+            rows = connection.execute("SELECT key, value FROM meta").fetchall()
+        return {str(k): str(v) for k, v in rows}
+    except Exception:  # noqa: BLE001 - old DBs have no meta table
+        return {}
 
 
 def _store_records(database_path: Path, records: list[FileRecord]) -> None:
@@ -593,17 +854,22 @@ def create_baseline(
     database_path = baseline_dir / "baseline.db"
     _init_database(database_path)
     _store_records(database_path, result.records)
+    created_utc = _utc_now_iso()
+    _store_meta(
+        database_path,
+        {"monitored_path": str(root), "created_utc": created_utc},
+    )
     payload: dict[str, Any] = {
         "version": BASELINE_VERSION,
-        "created_utc": _utc_now_iso(),
+        "created_utc": created_utc,
         "monitored_path": str(root),
         "files": [record.to_dict() for record in result.records],
     }
-    signed = sign_baseline(payload, key)
     json_path = baseline_dir / "baseline.json"
-    write_file_atomic(
-        json_path, json.dumps(signed, indent=2, sort_keys=True).encode("utf-8")
-    )
+    # Encrypted at rest (see _write_baseline_json). Note the SQLite
+    # baseline.db still holds the same records in plain form; protect
+    # it with OS file permissions, as documented in the README.
+    _write_baseline_json(json_path, payload, key)
     write_sha256_sidecar(json_path)
     for line in result.skipped:
         LOGGER.info("%s", line)
@@ -627,11 +893,10 @@ def load_baseline(baseline_dir: Path, key_path: Path) -> list[FileRecord]:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise BaselineError(f"Baseline is corrupt and cannot be read: {exc}") from exc
-    if not verify_signed_baseline(data, key):
-        raise BaselineError("Baseline tampered or corrupt.")
     if not verify_sha256_sidecar(json_path):
         raise BaselineError("Baseline tampered or corrupt.")
-    files = data.get("files")
+    payload = _read_baseline_payload(data, key)
+    files = payload.get("files")
     if not isinstance(files, list):
         raise BaselineError("Baseline is corrupt: file list is missing.")
     return [FileRecord.from_dict(item) for item in files]
@@ -733,7 +998,13 @@ def verify_baseline(
         "errors": len(result.errors),
     }
     verify_result = VerifyResult(
-        changes=changes, counts=counts, scanned_at_utc=_utc_now_iso()
+        changes=changes,
+        counts=counts,
+        scanned_at_utc=_utc_now_iso(),
+        records=list(result.records),
+    )
+    verify_result.mass_change = is_mass_change(
+        verify_result.changes, counts.get("total", 0)
     )
     database_path = Path(baseline_dir) / "baseline.db"
     if database_path.exists():
@@ -781,7 +1052,9 @@ def get_status(baseline_dir: Path) -> dict[str, Any]:
     database_path = baseline_dir / "baseline.db"
     if not json_path.exists() or not database_path.exists():
         raise BaselineError("Baseline not found. Run fim init first.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+    # baseline.json is encrypted in v1.1, so path/created come from the
+    # SQLite meta table (written by create_baseline), not from the JSON.
+    meta = _read_meta(database_path)
     with sqlite3.connect(str(database_path)) as connection:
         count = connection.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         row = connection.execute(
@@ -789,8 +1062,8 @@ def get_status(baseline_dir: Path) -> dict[str, Any]:
             "FROM scans ORDER BY id DESC LIMIT 1"
         ).fetchone()
     status: dict[str, Any] = {
-        "monitored_path": data.get("monitored_path", ""),
-        "created_utc": data.get("created_utc", ""),
+        "monitored_path": meta.get("monitored_path", ""),
+        "created_utc": meta.get("created_utc", ""),
         "file_count": int(count),
         "last_scan_utc": row[0] if row else "",
         "last_total": row[1] if row else 0,
@@ -854,6 +1127,7 @@ def write_report(report_dir: Path, root: Path, result: VerifyResult) -> Path:
         "scanned_at_utc": result.scanned_at_utc,
         "monitored_path": str(root),
         "counts": result.counts,
+        "mass_change": result.mass_change,
         "changes": [c.to_dict() for c in result.changes],
     }
     json_path = _unique_report_path(report_dir, stem, ".json")
@@ -862,12 +1136,18 @@ def write_report(report_dir: Path, root: Path, result: VerifyResult) -> Path:
     )
     text_path = json_path.with_suffix(".txt")
     lines = [
-        "File Integrity Monitor — verification report",
+        "File Integrity Monitor - verification report",
         f"Scanned at (UTC): {result.scanned_at_utc}",
         f"Monitored path: {sanitize_for_report(str(root))}",
         f"Counts: {result.counts}",
         "",
     ]
+    if result.mass_change:
+        lines.append(
+            "[CRITICAL] MASS CHANGE DETECTED: "
+            f"{len(result.changes)} files changed in one scan."
+        )
+        lines.append("")
     for change in result.changes:
         lines.append(
             f"[{change.kind}] {sanitize_for_report(change.relative_path)}"
@@ -910,13 +1190,78 @@ def write_report(report_dir: Path, root: Path, result: VerifyResult) -> Path:
     return json_path
 
 
+def export_scan_results(
+    report_dir: Path, root: Path, result: VerifyResult
+) -> tuple[Path, Path]:
+    """Export one verification (ALL files, not just changes) as JSON + CSV.
+
+    This reuses the same timestamped naming as write_report, so exports
+    never overwrite each other. Returns (json_path, csv_path).
+    """
+    report_dir = Path(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S")
+    stem = f"fim-export-{stamp}"
+    changed_by_path = {c.relative_path: c.kind for c in result.changes}
+    rows: list[dict[str, Any]] = []
+    for record in result.records:
+        rows.append(
+            {
+                "relative_path": record.relative_path,
+                "status": changed_by_path.get(record.relative_path, "OK"),
+                "sha256": record.sha256,
+                "size": record.size,
+                "mtime_utc": record.mtime_utc,
+            }
+        )
+    for change in result.changes:
+        if change.relative_path not in {r.relative_path for r in result.records}:
+            rows.append(
+                {
+                    "relative_path": change.relative_path,
+                    "status": change.kind,
+                    "sha256": change.new_record.sha256 if change.new_record else "",
+                    "size": change.new_record.size if change.new_record else 0,
+                    "mtime_utc": "",
+                }
+            )
+    rows.sort(key=lambda row: row["relative_path"])
+    payload = {
+        "app": "file-integrity-monitor",
+        "version": VERSION,
+        "scanned_at_utc": result.scanned_at_utc,
+        "monitored_path": str(root),
+        "counts": result.counts,
+        "files": rows,
+    }
+    json_path = _unique_report_path(report_dir, stem, ".json")
+    write_file_atomic(
+        json_path, json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    )
+    csv_path = json_path.with_suffix(".csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["relative_path", "status", "sha256", "size", "mtime_utc"])
+        for row in rows:
+            writer.writerow(
+                [
+                    row["relative_path"],
+                    row["status"],
+                    row["sha256"],
+                    row["size"],
+                    row["mtime_utc"],
+                ]
+            )
+    return json_path, csv_path
+
+
 def send_alert(change: Change, config: dict[str, Any], log_dir: Path) -> None:
     """Send one change through every enabled alert channel, never crashing."""
     channels = config.get("alert_channels", ["console", "log"])
     now_utc = _utc_now_iso()
     local_now = datetime.now().astimezone().isoformat()
     message = (
-        f"[ALERT] [{change.kind}] {change.relative_path} — "
+        f"[ALERT] [{change.kind}] {change.relative_path} - "
         f"old hash: {change.old_record.sha256 if change.old_record else ''} → "
         f"new hash: {change.new_record.sha256 if change.new_record else ''} "
         f"(old size {change.old_record.size if change.old_record else 0}, "
@@ -947,18 +1292,18 @@ def send_alert(change: Change, config: dict[str, Any], log_dir: Path) -> None:
         _send_email_alert(change, message)
 
 
-def _send_email_alert(change: Change, message: str) -> None:
-    """Send an email alert only when SMTP settings come from the environment."""
+def _send_email(subject: str, message: str) -> bool:
+    """Send one email from SMTP settings in the environment, or False."""
     host = os.environ.get("FIM_SMTP_HOST", "")
     user = os.environ.get("FIM_SMTP_USER", "")
     password = os.environ.get("FIM_SMTP_PASSWORD", "")
     recipient = os.environ.get("FIM_ALERT_EMAIL", "")
     if not all([host, user, password, recipient]):
         LOGGER.info("Email alerts disabled: SMTP settings are not configured.")
-        return
+        return False
     try:
         email = EmailMessage()
-        email["Subject"] = f"FIM alert: {change.kind} {change.relative_path}"
+        email["Subject"] = subject
         email["From"] = user
         email["To"] = recipient
         email.set_content(message)
@@ -966,16 +1311,327 @@ def _send_email_alert(change: Change, message: str) -> None:
             server.starttls()
             server.login(user, password)
             server.send_message(email)
+        return True
     except Exception:
         LOGGER.exception("Email alert failed.")
+        return False
+
+
+def _send_email_alert(change: Change, message: str) -> None:
+    """Send an email alert only when SMTP settings come from the environment."""
+    _send_email(f"FIM alert: {change.kind} {change.relative_path}", message)
+
+
+def is_mass_change(
+    changes: list[Change],
+    total_files: int,
+    config: dict[str, Any] | None = None,
+) -> bool:
+    """Return True when a scan trips the mass-change rule.
+
+    Rule (documented in the README): at least mass_change_threshold
+    files changed (default 10) OR at least mass_change_percent of
+    the files changed (default 20%), with at least 3 files changed
+    for the percentage branch - so a single changed file in a tiny
+    folder is not a "mass change". Either condition is enough.
+    """
+    if not changes:
+        return False
+    cfg = config or {}
+    threshold = int(cfg.get("mass_change_threshold", 10))
+    percent = int(cfg.get("mass_change_percent", 20))
+    if len(changes) >= threshold:
+        return True
+    return bool(
+        len(changes) >= 3
+        and total_files > 0
+        and len(changes) * 100 / total_files >= percent
+    )
+
+
+def _alert_mass_change(
+    changes: list[Change],
+    config: dict[str, Any],
+    log_dir: Path,
+    total_files: int,
+    monitored_path: str = "",
+) -> None:
+    """Send one [CRITICAL] mass-change alert through every channel."""
+    percent = (len(changes) * 100 / total_files) if total_files else 0
+    message = (
+        f"[CRITICAL] MASS CHANGE DETECTED: {len(changes)} of {total_files} "
+        f"files changed ({percent:.0f}%)"
+        + (f" in {monitored_path}" if monitored_path else "")
+        + " - possible ransomware or mass tampering. "
+        "Baseline NOT updated; review the changes before running update."
+    )
+    channels = config.get("alert_channels", ["console", "log"])
+    if "console" in channels:
+        print(f"{_utc_now_iso()} {message}")
+    if "log" in channels:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "alerts.log", "a", encoding="utf-8") as handle:
+                handle.write(f"{_utc_now_iso()} {message}\n")
+        except OSError:
+            LOGGER.exception("Could not write alerts.log.")
+    if "desktop" in channels:
+        try:
+            from plyer import notification
+
+            notification.notify(
+                title="File Integrity Monitor - CRITICAL",
+                message=message,
+                timeout=10,
+            )
+        except Exception:
+            LOGGER.debug("Desktop notification failed; continuing.", exc_info=True)
+    if "webhook" in channels:
+        send_webhook_alert(
+            changes, config, monitored_path=monitored_path, mass_change=True
+        )
+    if "email" in channels:
+        _send_email("FIM CRITICAL: mass change detected", message)
 
 
 def alert_for_changes(
-    changes: list[Change], config: dict[str, Any], log_dir: Path
+    changes: list[Change],
+    config: dict[str, Any],
+    log_dir: Path,
+    result: VerifyResult | None = None,
+    monitored_path: str = "",
 ) -> None:
     """Send alerts for every change in a verification result."""
     for change in changes:
         send_alert(change, config, log_dir)
+    total = int(result.counts.get("total", 0)) if result is not None else 0
+    mass_change = (
+        bool(result.mass_change)
+        if result is not None
+        else is_mass_change(changes, total, config)
+    )
+    if mass_change:
+        # The mass-change alert sends its own (flagged) webhook post.
+        _alert_mass_change(changes, config, log_dir, total, monitored_path)
+    elif changes and "webhook" in config.get("alert_channels", []):
+        # One webhook post per verification, not one per changed file.
+        send_webhook_alert(changes, config, monitored_path=monitored_path)
+
+
+def mask_webhook_url(url: str) -> str:
+    """Return a webhook URL with its path and query hidden for logging."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return "<invalid webhook url>"
+    if not parsed.scheme or not parsed.netloc:
+        return "<invalid webhook url>"
+    masked_path = "/***" if parsed.path else ""
+    return f"{parsed.scheme}://{parsed.netloc}{masked_path}"
+
+
+def get_webhook_url(config: dict[str, Any]) -> str:
+    """Return the webhook URL, with FIM_WEBHOOK_URL winning over config."""
+    override = os.environ.get("FIM_WEBHOOK_URL", "").strip()
+    if override:
+        return override
+    return str(config.get("webhook_url", "") or "").strip()
+
+
+def validate_webhook_url(url: str) -> str:
+    """Validate a webhook URL; return it stripped, or raise ConfigError.
+
+    Only http/https URLs are accepted. A URL with embedded credentials
+    is rejected. A localhost URL is allowed for local testing, but the
+    caller is warned about it in the log.
+    """
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        return ""
+    parsed = urllib.parse.urlparse(cleaned)
+    if parsed.scheme not in ("http", "https"):
+        raise ConfigError(
+            "Invalid config: webhook_url must start with http:// or https://."
+        )
+    if not parsed.netloc or parsed.username or parsed.password:
+        raise ConfigError(
+            "Invalid config: webhook_url must be a plain http(s) URL "
+            "without embedded credentials."
+        )
+    host = (parsed.hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1"):
+        LOGGER.warning(
+            "Webhook URL points at localhost (%s); use it for testing only.",
+            mask_webhook_url(cleaned),
+        )
+    return cleaned
+
+
+def build_webhook_payload(
+    changes: list[Change],
+    config: dict[str, Any],
+    scanned_at_utc: str = "",
+    monitored_path: str = "",
+    mass_change: bool = False,
+) -> dict[str, Any]:
+    """Build the JSON payload for one verification, per webhook type."""
+    webhook_type = str(config.get("webhook_type", "discord") or "discord")
+    lines = [
+        f"[{c.kind}] {c.relative_path}" + (f" (was {c.old_path})" if c.old_path else "")
+        for c in changes
+    ]
+    summary = f"File Integrity Monitor: {len(changes)} change(s) detected"
+    if mass_change:
+        summary = "MASS CHANGE DETECTED: " + summary
+    if monitored_path:
+        summary += f" in {monitored_path}"
+    change_dicts = [c.to_dict() for c in changes]
+    if webhook_type == "slack":
+        return {
+            "text": summary,
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": summary},
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "\n".join(lines) or "No changes.",
+                    },
+                },
+            ],
+        }
+    if webhook_type == "generic":
+        return {
+            "app": "file-integrity-monitor",
+            "version": VERSION,
+            "scanned_at_utc": scanned_at_utc or _utc_now_iso(),
+            "monitored_path": monitored_path,
+            "change_count": len(changes),
+            "mass_change": mass_change,
+            "changes": change_dicts,
+        }
+    # Discord (default): an embed with one line per change.
+    return {
+        "content": summary,
+        "embeds": [
+            {
+                "title": "File Integrity Monitor",
+                "description": "\n".join(lines) or "No changes.",
+                "color": 15158332,
+            }
+        ],
+    }
+
+
+def send_webhook_alert(
+    changes: list[Change],
+    config: dict[str, Any],
+    scanned_at_utc: str = "",
+    monitored_path: str = "",
+    mass_change: bool = False,
+) -> bool:
+    """POST one webhook alert; return True on success, False on any failure.
+
+    Failures are logged (with the URL masked) and never raise, so a
+    dead webhook can never crash a scan.
+    """
+    url = validate_webhook_url(get_webhook_url(config))
+    if not url:
+        LOGGER.info("Webhook alerts disabled: no webhook_url is configured.")
+        return False
+    payload = build_webhook_payload(
+        changes, config, scanned_at_utc, monitored_path, mass_change=mass_change
+    )
+    try:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"FileIntegrityMonitor/{VERSION}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+        LOGGER.info("Webhook alert sent to %s.", mask_webhook_url(url))
+        return True
+    except Exception:  # noqa: BLE001 - webhook failure must never crash a scan
+        LOGGER.warning(
+            "Webhook alert failed for %s; continuing.", mask_webhook_url(url)
+        )
+        return False
+
+
+def _parse_version(text: str) -> tuple[int, ...]:
+    """Parse "1.1.0" (or "v1.1.0") into a tuple for comparison."""
+    cleaned = str(text or "").strip().lstrip("vV")
+    parts: list[int] = []
+    for piece in cleaned.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) if parts else (0,)
+
+
+def check_for_update(
+    current_version: str = VERSION,
+    timeout: int = 10,
+) -> dict[str, Any]:
+    """Ask the GitHub Releases API for the latest release.
+
+    Returns a dict with current_version, latest_version,
+    is_update_available, download_url and release_url - or an "error"
+    key when the network or the API fails. It never raises.
+    """
+    try:
+        request = urllib.request.Request(
+            UPDATE_API_URL,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"FileIntegrityMonitor/{current_version}",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - network failure is a friendly message
+        return {
+            "current_version": current_version,
+            "latest_version": "",
+            "is_update_available": False,
+            "download_url": "",
+            "release_url": "",
+            "error": str(exc),
+        }
+    if not isinstance(data, dict):
+        return {
+            "current_version": current_version,
+            "latest_version": "",
+            "is_update_available": False,
+            "download_url": "",
+            "release_url": "",
+            "error": "Unexpected response from the GitHub API.",
+        }
+    latest = str(data.get("tag_name", "") or "").strip()
+    assets = data.get("assets") or []
+    download_url = ""
+    if isinstance(assets, list):
+        for asset in assets:
+            if isinstance(asset, dict) and str(asset.get("name", "")).endswith(".exe"):
+                download_url = str(asset.get("browser_download_url", "") or "")
+                break
+    return {
+        "current_version": current_version,
+        "latest_version": latest,
+        "is_update_available": bool(
+            latest and _parse_version(latest) > _parse_version(current_version)
+        ),
+        "download_url": download_url,
+        "release_url": str(data.get("html_url", "") or ""),
+    }
 
 
 def load_config(config_path: Path | None) -> dict[str, Any]:
@@ -985,7 +1641,7 @@ def load_config(config_path: Path | None) -> dict[str, Any]:
         return config
     path = Path(config_path)
     if not path.exists():
-        LOGGER.warning("Config file not found: %s — using defaults.", path)
+        LOGGER.warning("Config file not found: %s - using defaults.", path)
         return config
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -997,6 +1653,72 @@ def load_config(config_path: Path | None) -> dict[str, Any]:
         if key not in DEFAULT_CONFIG:
             raise ConfigError(f"Invalid config {path}: unknown field {key!r}.")
         config[key] = value
+    # FIM_WEBHOOK_URL wins over the config file, and is never written back.
+    env_webhook = os.environ.get("FIM_WEBHOOK_URL", "").strip()
+    if env_webhook:
+        config["webhook_url"] = env_webhook
+    webhook_url = str(config.get("webhook_url", "") or "")
+    config["webhook_url"] = validate_webhook_url(webhook_url)
+    webhook_type = str(config.get("webhook_type", "discord") or "discord")
+    if webhook_type not in WEBHOOK_TYPES:
+        raise ConfigError(
+            "Invalid config: webhook_type must be one of "
+            f"{', '.join(WEBHOOK_TYPES)}."
+        )
+    config["webhook_type"] = webhook_type
+    channels = config.get("alert_channels", ["console", "log"])
+    if not isinstance(channels, list) or any(
+        str(c) not in ALERT_CHANNELS for c in channels
+    ):
+        raise ConfigError(
+            "Invalid config: alert_channels must only contain "
+            f"{', '.join(ALERT_CHANNELS)}."
+        )
+    if "webhook" in channels and not config["webhook_url"]:
+        LOGGER.warning(
+            "alert_channels includes 'webhook' but no webhook_url is set; "
+            "webhook alerts will be skipped."
+        )
+    threshold = config.get("mass_change_threshold", 10)
+    if (
+        not isinstance(threshold, int)
+        or isinstance(threshold, bool)
+        or threshold < 1
+        or threshold > 10000
+    ):
+        raise ConfigError(
+            "Invalid config: mass_change_threshold must be an integer "
+            "between 1 and 10000."
+        )
+    percent = config.get("mass_change_percent", 20)
+    if (
+        not isinstance(percent, int)
+        or isinstance(percent, bool)
+        or percent < 1
+        or percent > 100
+    ):
+        raise ConfigError(
+            "Invalid config: mass_change_percent must be an integer "
+            "between 1 and 100."
+        )
+    theme = str(config.get("gui_theme", "light") or "light")
+    if theme not in ("light", "dark"):
+        raise ConfigError('Invalid config: gui_theme must be "light" or "dark".')
+    config["gui_theme"] = theme
+    if not isinstance(config.get("check_for_updates", True), bool):
+        raise ConfigError("Invalid config: check_for_updates must be true or false.")
+    scheduled = config.get("scheduled_scan_interval_minutes", 0)
+    if (
+        not isinstance(scheduled, int)
+        or isinstance(scheduled, bool)
+        or scheduled < 0
+        or (scheduled != 0 and scheduled < 5)
+        or scheduled > 1440
+    ):
+        raise ConfigError(
+            "Invalid config: scheduled_scan_interval_minutes must be 0 (off) "
+            "or between 5 and 1440 minutes."
+        )
     interval = config.get("scan_interval_seconds", 60)
     if (
         not isinstance(interval, int)
@@ -1023,7 +1745,7 @@ def print_summary(result: VerifyResult) -> None:
     """Print a coloured summary table for a verification run."""
     enable_windows_colours()
     counts = result.counts
-    print("File Integrity Monitor — summary")
+    print("File Integrity Monitor - summary")
     print(f"  Total:              {counts.get('total', 0)}")
     print(f"  Unchanged:          {counts.get('unchanged', 0)}")
     print(f"  Added:              {counts.get('added', 0)}")
@@ -1032,6 +1754,12 @@ def print_summary(result: VerifyResult) -> None:
     print(f"  Renamed:            {counts.get('renamed', 0)}")
     print(f"  Permission changed: {counts.get('permission_changed', 0)}")
     print(f"  Errors:             {counts.get('errors', 0)}")
+    if result.mass_change:
+        print(
+            "[CRITICAL] MASS CHANGE DETECTED: "
+            f"{len(result.changes)} files changed in one scan. "
+            "Baseline NOT updated."
+        )
     if result.changes:
         print("Changes:")
         for change in result.changes:

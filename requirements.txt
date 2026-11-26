@@ -7,6 +7,11 @@ watchdog>=4.0
 # Desktop notifications (falls back to console/log alerts if missing).
 plyer>=2.1
 
+# System tray icon in the GUI (optional; the GUI works without it).
+# Pillow is needed to draw the tray icon.
+pystray>=0.19
+Pillow>=10.0
+
 # Development and testing only.
 pytest>=8.0
 black>=24.0

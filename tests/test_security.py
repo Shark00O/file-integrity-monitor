@@ -25,18 +25,27 @@ FORBIDDEN = ["eval(", "exec(", "pickle", "shell=True", "os.system", "md5", "sha1
 def test_no_forbidden_patterns_in_source() -> None:
     """Source files must contain no unsafe constructs or weak hashes."""
     project_root = Path(__file__).resolve().parent.parent
-    for name in ("fim.py", "fim_core.py", "fim_monitor.py", "fim_gui.py"):
+    for name in (
+        "fim.py",
+        "fim_core.py",
+        "fim_monitor.py",
+        "fim_gui.py",
+        "fim_tray.py",
+    ):
         text = (project_root / name).read_text(encoding="utf-8")
         for pattern in FORBIDDEN:
             assert pattern not in text, f"{name} contains forbidden pattern {pattern!r}"
 
 
 def test_tampered_baseline_json_rejected(monitored_dir, baseline_dir, key_path) -> None:
-    """Editing one hash in baseline.json must make verification refuse it."""
+    """Flipping one character of the encrypted baseline must be refused."""
     create_baseline(monitored_dir, baseline_dir, key_path)
     json_path = baseline_dir / "baseline.json"
     data = json.loads(json_path.read_text(encoding="utf-8"))
-    data["files"][0]["sha256"] = "0" * 64
+    # Flip a character in the ciphertext (not in the HMAC field).
+    encoded = data["data"]
+    flipped = ("A" if encoded[0] != "A" else "B") + encoded[1:]
+    data["data"] = flipped
     json_path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(BaselineError, match="tampered"):
         verify_baseline(monitored_dir, baseline_dir, key_path)
@@ -61,7 +70,8 @@ def test_tampered_baseline_is_not_overwritten(
     json_path = baseline_dir / "baseline.json"
     before = json_path.read_bytes()
     data = json.loads(before.decode("utf-8"))
-    data["files"][0]["sha256"] = "0" * 64
+    encoded = data["data"]
+    data["data"] = ("A" if encoded[0] != "A" else "B") + encoded[1:]
     json_path.write_text(json.dumps(data), encoding="utf-8")
     tampered = json_path.read_bytes()
     with pytest.raises(BaselineError):

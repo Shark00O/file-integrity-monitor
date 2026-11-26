@@ -1,1 +1,31 @@
-{"alert_channels":["console","log","desktop"],"baseline_path":"baseline","exclude_patterns":["*.tmp","*.log","__pycache__","*.bak"],"hash_chunk_size":65536,"include_patterns":[],"log_level":"INFO","max_file_size_mb":0,"monitored_paths":["C:\\Users\\Shaikh\\Documents\\Important"],"recursive":true,"report_dir":"reports","scan_interval_seconds":60}
+{
+  "alert_channels": [
+    "console",
+    "log",
+    "desktop"
+  ],
+  "baseline_path": "baseline",
+  "check_for_updates": true,
+  "exclude_patterns": [
+    "*.tmp",
+    "*.log",
+    "__pycache__",
+    "*.bak"
+  ],
+  "gui_theme": "light",
+  "hash_chunk_size": 65536,
+  "include_patterns": [],
+  "log_level": "INFO",
+  "mass_change_percent": 20,
+  "mass_change_threshold": 10,
+  "max_file_size_mb": 0,
+  "monitored_paths": [
+    "C:\\Users\\you\\Documents\\Important"
+  ],
+  "recursive": true,
+  "report_dir": "reports",
+  "scan_interval_seconds": 60,
+  "scheduled_scan_interval_minutes": 0,
+  "webhook_type": "discord",
+  "webhook_url": ""
+}

@@ -36,10 +36,12 @@ def test_baseline_json_is_signed(monitored_dir, baseline_dir, key_path) -> None:
     data = json.loads((baseline_dir / "baseline.json").read_text(encoding="utf-8"))
     assert "hmac" in data
     assert len(data["hmac"]) == 64
-    assert data["version"] == 1
-    assert key_path.read_bytes().hex() not in (
-        baseline_dir / "baseline.json"
-    ).read_text(encoding="utf-8")
+    assert data["format"] == "fim-encrypted-v1"
+    # The plaintext (file names, version) must not appear in the file.
+    raw = (baseline_dir / "baseline.json").read_text(encoding="utf-8")
+    assert "a.txt" not in raw
+    assert key_path.read_bytes().hex() not in raw
+    assert load_baseline(baseline_dir, key_path)[0].relative_path == "a.txt"
 
 
 def test_key_is_32_random_bytes(key_path) -> None:

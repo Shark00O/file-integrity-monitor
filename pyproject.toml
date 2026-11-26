@@ -1,3 +1,9 @@
+[project]
+name = "file-integrity-monitor"
+version = "1.1.0"
+description = "File Integrity Monitor - SHA-256 baseline, verify and monitor."
+requires-python = ">=3.11"
+
 [tool.black]
 line-length = 88
 
@@ -10,6 +16,7 @@ line-length = 88
 [tool.ruff.lint.per-file-ignores]
 "fim_monitor.py" = ["BLE001"]
 "fim_gui.py" = ["BLE001"]
+"fim_tray.py" = ["BLE001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

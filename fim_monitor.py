@@ -1,10 +1,10 @@
-# File Integrity Monitor — real-time monitoring.
+# File Integrity Monitor - real-time monitoring.
 # Polling is the default; watchdog is used only when it is installed.
 """Polling and watchdog monitoring for the File Integrity Monitor.
 
-This module is deliberately separate from fim_core: the core knows how
+This module is separate from fim_core: the core knows how
 to hash and compare, this module knows how to watch a tree over time.
-A monitor run never updates the baseline on its own — it only reports.
+A monitor run never updates the baseline on its own - it only reports.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def _run_polling(
             continue
         if result.changes:
             total_changes += len(result.changes)
-            alert_for_changes(result.changes, config, log_dir)
+            alert_for_changes(result.changes, config, log_dir, result, str(root))
             if on_change is not None:
                 on_change(result.changes)
         cycles += 1
@@ -176,7 +176,9 @@ def _run_watchdog(
                     result = None
                 if result is not None and result.changes:
                     state["changes"] += len(result.changes)
-                    alert_for_changes(result.changes, config, log_dir)
+                    alert_for_changes(
+                        result.changes, config, log_dir, result, str(root)
+                    )
                     if on_change is not None:
                         on_change(result.changes)
                 state["cycles"] += 1

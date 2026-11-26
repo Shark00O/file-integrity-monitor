@@ -1,0 +1,13 @@
+# Core engine: Python standard library only. No required dependencies.
+# Everything below is optional. The tool works without any of them.
+
+# Real-time monitoring with watchdog (falls back to polling if missing).
+watchdog>=4.0
+
+# Desktop notifications (falls back to console/log alerts if missing).
+plyer>=2.1
+
+# Development and testing only.
+pytest>=8.0
+black>=24.0
+ruff>=0.4.0

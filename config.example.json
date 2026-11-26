@@ -1,0 +1,1 @@
+{"alert_channels":["console","log","desktop"],"baseline_path":"baseline","exclude_patterns":["*.tmp","*.log","__pycache__","*.bak"],"hash_chunk_size":65536,"include_patterns":[],"log_level":"INFO","max_file_size_mb":0,"monitored_paths":["C:\\Users\\Shaikh\\Documents\\Important"],"recursive":true,"report_dir":"reports","scan_interval_seconds":60}

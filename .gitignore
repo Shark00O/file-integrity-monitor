@@ -1,0 +1,28 @@
+# Baselines and keys — never commit these. A leaked baseline or key
+# lets an attacker forge a clean baseline.
+baseline/baseline.db
+baseline/baseline.json
+baseline/baseline.json.sha256
+fim.key
+**/fim.key
+
+# Logs and reports (local run output) — keep the .gitkeep files.
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# PyInstaller build output — never commit the .exe or build folders.
+dist/
+build/
+*.spec

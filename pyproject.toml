@@ -1,0 +1,15 @@
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
+
+# BLE001 (broad except) is ignored in the monitor and GUI on purpose:
+# one failed scan or one alert failure must never crash the monitor
+# or close the window. Every other module still reports BLE001.
+[tool.ruff.lint.per-file-ignores]
+"fim_monitor.py" = ["BLE001"]
+"fim_gui.py" = ["BLE001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
